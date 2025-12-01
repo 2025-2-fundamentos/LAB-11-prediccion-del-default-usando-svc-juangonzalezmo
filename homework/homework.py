@@ -95,3 +95,189 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+import pandas as pd
+from pathlib import Path
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import make_pipeline as build_pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.feature_selection import SelectKBest
+from sklearn.decomposition import PCA
+
+
+def cargar_datos(nombre_archivo):
+    ruta_base = Path("files/input")
+    return pd.read_csv(ruta_base / nombre_archivo, compression="zip")
+
+
+def depurar_datos(data: pd.DataFrame):
+    df = data.copy()
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns="ID")
+    df = df.dropna()
+    df = df[df["MARRIAGE"] != 0]
+    df = df[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].map(lambda valor: 4 if valor > 4 else valor)
+    return df
+
+
+def separar_variables(data: pd.DataFrame):
+    caracteristicas = data.drop(columns="default").copy()
+    objetivo = data["default"].copy()
+    return caracteristicas, objetivo
+
+
+def dividir_datos(data: pd.DataFrame):
+    from sklearn.model_selection import train_test_split
+
+    caracteristicas, objetivo = separar_variables(data)
+    return train_test_split(caracteristicas, objetivo, random_state=0)
+
+
+def pipeline():
+    transformador = ColumnTransformer(
+        transformers=[
+            (
+                "cat",
+                OneHotEncoder(handle_unknown="ignore"),
+                ["SEX", "EDUCATION", "MARRIAGE"],
+            )
+        ],
+        remainder=StandardScaler(),
+    )
+
+    modelo_svm = build_pipeline(
+        transformador,
+        PCA(),
+        SelectKBest(k=12),
+        SVC(gamma=0.1),
+    )
+
+    return modelo_svm
+
+
+def grid_search(modelo, parametros, cv=10):
+    return GridSearchCV(
+        estimator=modelo,
+        param_grid=parametros,
+        cv=cv,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+    )
+
+
+def guardar_modelo(modelo):
+    import pickle
+    import gzip
+
+    ruta_modelos = Path("files/models")
+    ruta_modelos.mkdir(exist_ok=True)
+
+    with gzip.open(ruta_modelos / "model.pkl.gz", "wb") as archivo:
+        pickle.dump(modelo, archivo)
+
+
+def guardar_metricas(lista_metricas):
+    import json
+
+    ruta_salida = Path("files/output")
+    ruta_salida.mkdir(exist_ok=True)
+
+    with open(ruta_salida / "metrics.json", "w") as archivo:
+        lineas = [json.dumps(metrica) + "\n" for metrica in lista_metricas]
+        archivo.writelines(lineas)
+
+
+def entrenar_modelo(caracteristicas_entrenamiento, objetivo_entrenamiento):
+    modelo_base = pipeline()
+
+    busqueda = grid_search(
+        modelo_base,
+        {
+            "pca__n_components": [20, 21],
+        },
+    )
+
+    busqueda.fit(caracteristicas_entrenamiento, objetivo_entrenamiento)
+    guardar_modelo(busqueda)
+    return busqueda
+
+
+def metricas(valores_reales, valores_estimados):
+    from sklearn.metrics import (
+        precision_score,
+        balanced_accuracy_score,
+        recall_score,
+        f1_score,
+    )
+
+    precision = precision_score(valores_reales, valores_estimados)
+    balanced_acc = balanced_accuracy_score(valores_reales, valores_estimados)
+    sensibilidad = recall_score(valores_reales, valores_estimados)
+    puntaje_f1 = f1_score(valores_reales, valores_estimados)
+
+    return precision, balanced_acc, sensibilidad, puntaje_f1
+
+
+def matriz_c(nombre_conjunto, valores_reales, valores_estimados):
+    from sklearn.metrics import confusion_matrix
+
+    matriz = confusion_matrix(valores_reales, valores_estimados)
+
+    return {
+        "type": "cm_matrix",
+        "dataset": nombre_conjunto,
+        "true_0": {
+            "predicted_0": int(matriz[0][0]),
+            "predicted_1": int(matriz[0][1]),
+        },
+        "true_1": {
+            "predicted_0": int(matriz[1][0]),
+            "predicted_1": int(matriz[1][1]),
+        },
+    }
+
+
+def ejecutar_proceso():
+    df_entrenamiento = depurar_datos(cargar_datos("train_data.csv.zip"))
+    df_prueba = depurar_datos(cargar_datos("test_data.csv.zip"))
+
+    x_entrenamiento, y_entrenamiento = separar_variables(df_entrenamiento)
+    x_prueba, y_prueba = separar_variables(df_prueba)
+
+    modelo_entrenado = entrenar_modelo(x_entrenamiento, y_entrenamiento)
+
+    resultados_metricas = []
+    for nombre_conjunto, x, y in [
+        ("train", x_entrenamiento, y_entrenamiento),
+        ("test", x_prueba, y_prueba),
+    ]:
+        predicciones = modelo_entrenado.predict(x)
+        precision, balanced_acc, sensibilidad, puntaje_f1 = metricas(y, predicciones)
+        resultados_metricas.append(
+            {
+                "type": "metrics",
+                "dataset": nombre_conjunto,
+                "precision": precision,
+                "balanced_accuracy": balanced_acc,
+                "recall": sensibilidad,
+                "f1_score": puntaje_f1,
+            }
+        )
+
+    matrices_confusion = [
+        matriz_c(nombre_conjunto, y, modelo_entrenado.predict(x))
+        for nombre_conjunto, x, y in [
+            ("train", x_entrenamiento, y_entrenamiento),
+            ("test", x_prueba, y_prueba),
+        ]
+    ]
+
+    guardar_metricas(resultados_metricas + matrices_confusion)
+
+
+ejecutar_proceso()
